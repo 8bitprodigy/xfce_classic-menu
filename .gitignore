@@ -1,0 +1,60 @@
+# Autotools generated files
+Makefile
+Makefile.in
+aclocal.m4
+autom4te.cache/
+compile
+config.guess
+config.h
+config.h.in
+config.log
+config.status
+config.sub
+configure
+depcomp
+install-sh
+libtool
+ltmain.sh
+missing
+stamp-h1
+m4/libtool.m4
+m4/ltoptions.m4
+m4/ltsugar.m4
+m4/ltversion.m4
+m4/lt~obsolete.m4
+
+# Build artifacts
+*.o
+*.lo
+*.la
+.deps/
+.libs/
+*.so
+*.a
+
+# Desktop file (generated from .in)
+panel-plugin/classic-menu.desktop
+
+# Backup and temp files
+*~
+*.bak
+*.swp
+*.swo
+.*.sw?
+
+# Distribution tarballs
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-*
+.project
+.cproject
+.settings/
+
+# OS specific
+.DS_Store
+Thumbs.db
