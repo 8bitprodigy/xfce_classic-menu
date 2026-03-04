@@ -13,6 +13,6 @@ GtkWidget *build_applications_menu(GarconMenu **garcon_menu_ptr);
 GtkWidget *build_places_menu(void);
 
 /* system-menu.c */
-GtkWidget *build_system_menu(void);
+GtkWidget *build_system_menu(GarconMenu **garcon_menu_ptr);
 
 #endif /* __CLASSIC_MENU_H__ */

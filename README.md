@@ -1,9 +1,14 @@
 # XFCE4 Classic-Menu
 
-A GNOME2-style classic menu for XFCE.
-This is currently very early in development and could be considered more or less a skeleton project at the moment.
+A GNOME2/MATE-style classic menu for XFCE4, implemented as a panel plugin.
 
-## Building:
+## What's implemented
+
+- **Applications** — fully populated from the system's XDG application menu via garcon, organized by category. The Settings and System categories are intentionally excluded here and surfaced under the System menu instead.
+- **Places** — mirrors your Thunar sidebar bookmarks exactly, by reading the same GTK bookmarks file Thunar uses. Includes Home, your personal bookmarks, Computer, Network, and Connect to Server.
+- **System** — Settings Manager, Preferences and Administration submenus (also populated via garcon), Help, About XFCE, Lock Screen, and Log Out.
+
+## Building
 
 ```shell
 make
