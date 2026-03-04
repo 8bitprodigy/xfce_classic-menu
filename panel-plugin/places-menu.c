@@ -1,6 +1,20 @@
 /* places-menu.c - Places menu implementation */
 
 #include "classic-menu.h"
+#include "appimage-thumbs.h"
+#include <gio/gio.h>
+
+/* The active drill-down mode, set once per build_places_menu() call and
+ * read by the recursive folder population functions. */
+static DrillDownMode current_drilldown_mode = DRILLDOWN_FOLDERS_ONLY;
+
+/* Forward declaration */
+static void append_folder_item(GtkWidget   *menu,
+                               const gchar *label,
+                               const gchar *icon_name,
+                               const gchar *path);
+
+/* ── Helpers ────────────────────────────────────────────────────────────── */
 
 /* Create a menu item with icon and label */
 static GtkWidget *
@@ -35,8 +49,8 @@ static void
 on_place_activate(GtkMenuItem *item, gpointer user_data)
 {
     const gchar *uri = (const gchar *)user_data;
-    GError *error = NULL;
-    gchar *command;
+    GError *error    = NULL;
+    gchar  *command;
 
     command = g_strdup_printf("exo-open --launch FileManager '%s'", uri);
 
@@ -53,7 +67,50 @@ on_place_activate(GtkMenuItem *item, gpointer user_data)
     g_free(command);
 }
 
-/* Append an item that owns its own copy of the URI string */
+/* Open a local path on click.  Connected to "button-release-event" so
+ * that merely hovering to reveal a submenu does not trigger a launch.
+ * Directories open in the file manager; executable files and AppImages
+ * are launched directly. */
+static gboolean
+on_folder_click(GtkWidget *item, GdkEventButton *event, gpointer user_data)
+{
+    const gchar *uri = (const gchar *)user_data;
+    gchar       *path;
+    GError      *error   = NULL;
+    gboolean     handled = FALSE;
+
+    if (event->button != 1) {
+        return FALSE;
+    }
+
+    path = g_filename_from_uri(uri, NULL, NULL);
+
+    if (path != NULL && !g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        /* It's a file — open it with its default application, respecting
+         * MIME type associations exactly as Thunar would on double-click. */
+        if (g_app_info_launch_default_for_uri(uri, NULL, &error)) {
+            handled = TRUE;
+        } else {
+            g_warning("Failed to open %s: %s", uri,
+                      error ? error->message : "Unknown error");
+            if (error) g_error_free(error);
+        }
+    }
+
+    g_free(path);
+
+    if (!handled) {
+        on_place_activate(GTK_MENU_ITEM(item), user_data);
+    }
+
+    gtk_menu_shell_deactivate(
+            GTK_MENU_SHELL(gtk_widget_get_parent(item))
+        );
+
+    return TRUE;
+}
+
+/* Append a plain URI item (for non-local or non-directory entries) */
 static void
 append_uri_item(GtkWidget   *menu,
                 const gchar *label,
@@ -71,23 +128,693 @@ append_uri_item(GtkWidget   *menu,
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 }
 
-/* Read ~/.config/gtk-3.0/bookmarks (falling back to ~/.gtk-bookmarks) and
- * append each entry to the menu.  This is the exact same file Thunar reads
- * for its sidebar, so the Places menu will mirror the Thunar sidebar
- * automatically — personal bookmarks and all.
+/* ── Lazy drill-down ────────────────────────────────────────────────────── */
+
+/* Callback data for lazy submenu population */
+typedef struct {
+    gchar *path;  /* owned */
+} FolderSubmenuData;
+
+static void
+folder_submenu_data_free(gpointer data)
+{
+    FolderSubmenuData *d = (FolderSubmenuData *)data;
+    g_free(d->path);
+    g_free(d);
+}
+
+/* Called the first time a folder submenu is about to be shown.
+ * Removes the dummy placeholder, then populates with immediate child
+ * directories sorted alphabetically.  Hidden entries (dot-prefixed)
+ * are skipped.  Files are included or excluded based on the current
+ * drill-down mode.  If there is nothing to show, an "(Empty)" sentinel
+ * is shown so the submenu arrow doesn't just disappear. */
+static void
+on_folder_submenu_show(GtkWidget *submenu, gpointer user_data)
+{
+    FolderSubmenuData *d = (FolderSubmenuData *)user_data;
+    GDir              *dir;
+    GError            *error = NULL;
+    const gchar       *name;
+    GList             *dirs  = NULL;
+    GList             *files = NULL;
+    GList             *li;
+    gboolean           any   = FALSE;
+
+    /* Only populate once */
+    g_signal_handlers_disconnect_by_func(
+            submenu,
+            G_CALLBACK(on_folder_submenu_show),
+            user_data
+        );
+
+    /* Remove the dummy placeholder child */
+    {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(submenu));
+        g_list_free_full(children, (GDestroyNotify) gtk_widget_destroy);
+    }
+
+    dir = g_dir_open(d->path, 0, &error);
+    if (dir == NULL) {
+        g_warning("Could not open directory %s: %s",
+                  d->path, error ? error->message : "Unknown error");
+        if (error) g_error_free(error);
+        goto empty;
+    }
+
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        gchar *child_path;
+
+        if (name[0] == '.') {
+            continue;
+        }
+
+        child_path = g_build_filename(d->path, name, NULL);
+
+        if (g_file_test(child_path, G_FILE_TEST_IS_DIR)) {
+            dirs = g_list_prepend(dirs, child_path);
+        } else if (current_drilldown_mode == DRILLDOWN_ALL_CONTENTS) {
+            files = g_list_prepend(files, child_path);
+        } else if (current_drilldown_mode == DRILLDOWN_FOLDERS_APPIMAGES) {
+            if (g_str_has_suffix(name, ".AppImage")
+                    || g_str_has_suffix(name, ".appimage")) {
+                files = g_list_prepend(files, child_path);
+            } else {
+                g_free(child_path);
+            }
+        } else {
+            g_free(child_path);
+        }
+    }
+    g_dir_close(dir);
+
+    if (dirs == NULL && files == NULL) {
+        goto empty;
+    }
+
+    /* Directories first, sorted */
+    dirs = g_list_sort(dirs, (GCompareFunc) g_ascii_strcasecmp);
+    for (li = dirs; li != NULL; li = li->next) {
+        gchar       *child_path = (gchar *)li->data;
+        const gchar *basename   = g_path_get_basename(child_path);
+        append_folder_item(submenu, basename, "folder", child_path);
+        any = TRUE;
+    }
+    g_list_free_full(dirs, g_free);
+
+    /* Files after a separator, sorted */
+    if (files != NULL) {
+        if (any) {
+            GtkWidget *sep = gtk_separator_menu_item_new();
+            gtk_menu_shell_append(GTK_MENU_SHELL(submenu), sep);
+        }
+
+        files = g_list_sort(files, (GCompareFunc) g_ascii_strcasecmp);
+        for (li = files; li != NULL; li = li->next) {
+            gchar         *child_path = (gchar *)li->data;
+            const gchar   *basename   = g_path_get_basename(child_path);
+            gchar         *uri        = g_filename_to_uri(child_path, NULL, NULL);
+            GtkWidget     *file_item;
+            gchar         *icon_name  = NULL;
+
+            /* For AppImages use the executable icon as placeholder —
+             * appimage_load_icon_async will replace it asynchronously. */
+            if (g_str_has_suffix(basename, ".AppImage")
+                    || g_str_has_suffix(basename, ".appimage")) {
+                icon_name = g_strdup("application-x-executable");
+            } else {                /* Ask GIO for the MIME icon list, then walk it to find
+                 * the first name that actually exists in the current
+                 * theme.  This avoids broken icons from overly-specific
+                 * names (e.g. "application-x-iso9660-appimage") that
+                 * most themes don't ship. */
+                GFile         *gfile      = g_file_new_for_path(child_path);
+                GFileInfo     *info       = g_file_query_info(
+                        gfile,
+                        G_FILE_ATTRIBUTE_STANDARD_ICON,
+                        G_FILE_QUERY_INFO_NONE,
+                        NULL, NULL
+                    );
+                GtkIconTheme  *theme      = gtk_icon_theme_get_default();
+
+                if (info != NULL) {
+                    GIcon *gicon = g_file_info_get_icon(info);
+                    if (G_IS_THEMED_ICON(gicon)) {
+                        const gchar * const *names =
+                            g_themed_icon_get_names(G_THEMED_ICON(gicon));
+                        for (gint n = 0;
+                                names != NULL && names[n] != NULL && icon_name == NULL;
+                                n++) {
+                            if (gtk_icon_theme_has_icon(theme, names[n])) {
+                                icon_name = g_strdup(names[n]);
+                            }
+                        }
+                    }
+                    g_object_unref(info);
+                }
+                g_object_unref(gfile);
+            }
+
+            if (icon_name == NULL) {
+                icon_name = g_strdup("text-x-generic");
+            }
+
+            file_item = create_menu_item_with_icon(basename, icon_name);
+
+            /* For AppImages, kick off async thumbnail loading to replace
+             * the placeholder icon once extraction/cache lookup is done. */
+            if (g_str_has_suffix(basename, ".AppImage")
+                    || g_str_has_suffix(basename, ".appimage")) {
+                GtkWidget *box  = gtk_bin_get_child(GTK_BIN(file_item));
+                GList     *kids = gtk_container_get_children(GTK_CONTAINER(box));
+                if (kids != NULL && GTK_IS_IMAGE(kids->data)) {
+                    appimage_load_icon_async(GTK_IMAGE(kids->data), child_path);
+                }
+                g_list_free(kids);
+            }
+
+            g_free(icon_name);
+
+            g_signal_connect_data(
+                    G_OBJECT(file_item), "button-release-event",
+                    G_CALLBACK(on_folder_click),
+                    uri,
+                    (GClosureNotify) g_free,
+                    0
+                );
+            gtk_menu_shell_append(GTK_MENU_SHELL(submenu), file_item);
+            any = TRUE;
+        }
+        g_list_free_full(files, g_free);
+    }
+
+    if (any) {
+        gtk_widget_show_all(submenu);
+        return;
+    }
+
+empty:
+    {
+        GtkWidget *empty_item = gtk_menu_item_new_with_label("(Empty)");
+        gtk_widget_set_sensitive(empty_item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), empty_item);
+        gtk_widget_show_all(submenu);
+    }
+}
+
+/* Append a local folder item.
  *
- * Format: one entry per line:  <URI> [optional label]
- * Lines beginning with '#' are comments. */
+ * Clicking it opens the folder in the file manager.  If the directory
+ * has any child directories a submenu arrow is shown; hovering it lazily
+ * populates and displays a submenu listing those children, each with the
+ * same behaviour recursively. */
+static void
+append_folder_item(GtkWidget   *menu,
+                   const gchar *label,
+                   const gchar *icon_name,
+                   const gchar *path)
+{
+    GtkWidget         *item;
+    gchar             *uri;
+    gboolean           has_subdirs = FALSE;
+
+    item = create_menu_item_with_icon(label, icon_name);
+
+    uri = g_filename_to_uri(path, NULL, NULL);
+    g_signal_connect_data(
+            G_OBJECT(item), "button-release-event",
+            G_CALLBACK(on_folder_click),
+            uri,
+            (GClosureNotify) g_free,
+            0
+        );
+
+    /* When drill-down is disabled, just append the item with no submenu */
+    if (current_drilldown_mode == DRILLDOWN_NONE) {
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+        return;
+    }
+
+    /* Check cheaply whether there is anything to show in the submenu
+     * so we only attach a submenu arrow when it's actually warranted. */
+    {
+        GDir        *dir = g_dir_open(path, 0, NULL);
+        const gchar *name;
+
+        if (dir != NULL) {
+            while ((name = g_dir_read_name(dir)) != NULL) {
+                gchar *child;
+
+                if (name[0] == '.') {
+                    continue;
+                }
+
+                child = g_build_filename(path, name, NULL);
+
+                if (g_file_test(child, G_FILE_TEST_IS_DIR)) {
+                    has_subdirs = TRUE;
+                    g_free(child);
+                    break;
+                }
+
+                /* Also count files that would be shown per the current mode */
+                if (current_drilldown_mode == DRILLDOWN_ALL_CONTENTS) {
+                    has_subdirs = TRUE;
+                    g_free(child);
+                    break;
+                }
+                if (current_drilldown_mode == DRILLDOWN_FOLDERS_APPIMAGES
+                        && (g_str_has_suffix(name, ".AppImage")
+                            || g_str_has_suffix(name, ".appimage"))) {
+                    has_subdirs = TRUE;
+                    g_free(child);
+                    break;
+                }
+
+                g_free(child);
+            }
+            g_dir_close(dir);
+        }
+    }
+
+    if (has_subdirs) {
+        /* Attach a lazy submenu.  GTK requires a submenu to have at
+         * least one child before it will show the arrow, so we insert
+         * a dummy placeholder that gets replaced on first show. */
+        GtkWidget         *submenu = gtk_menu_new();
+        GtkWidget         *dummy   = gtk_menu_item_new();
+        FolderSubmenuData *data    = g_new0(FolderSubmenuData, 1);
+
+        gtk_menu_set_reserve_toggle_size(GTK_MENU(submenu), FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), dummy);
+
+        data->path = g_strdup(path);
+
+        g_signal_connect_data(
+                G_OBJECT(submenu), "show",
+                G_CALLBACK(on_folder_submenu_show),
+                data,
+                (GClosureNotify) folder_submenu_data_free,
+                0
+            );
+
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
+    }
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+/* ── Computer drill-down ────────────────────────────────────────────────── */
+
+/* Lazily populate a submenu for a mounted volume by delegating to the
+ * folder drill-down logic on the mount's root path. */
+static void
+on_mount_submenu_show(GtkWidget *submenu, gpointer user_data)
+{
+    const gchar *root_path = (const gchar *)user_data;
+    GDir        *dir;
+    const gchar *name;
+    GList       *dirs = NULL;
+    GList       *li;
+    gboolean     any  = FALSE;
+
+    g_signal_handlers_disconnect_by_func(
+            submenu,
+            G_CALLBACK(on_mount_submenu_show),
+            user_data
+        );
+
+    /* Remove dummy placeholder */
+    {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(submenu));
+        g_list_free_full(children, (GDestroyNotify) gtk_widget_destroy);
+    }
+
+    dir = g_dir_open(root_path, 0, NULL);
+    if (dir == NULL) {
+        goto empty;
+    }
+
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        gchar *child_path;
+
+        if (name[0] == '.') {
+            continue;
+        }
+
+        child_path = g_build_filename(root_path, name, NULL);
+        if (g_file_test(child_path, G_FILE_TEST_IS_DIR)) {
+            dirs = g_list_prepend(dirs, child_path);
+        } else {
+            g_free(child_path);
+        }
+    }
+    g_dir_close(dir);
+
+    if (dirs == NULL) {
+        goto empty;
+    }
+
+    dirs = g_list_sort(dirs, (GCompareFunc) g_ascii_strcasecmp);
+
+    for (li = dirs; li != NULL; li = li->next) {
+        gchar       *child_path = (gchar *)li->data;
+        const gchar *basename   = g_path_get_basename(child_path);
+        append_folder_item(submenu, basename, "folder", child_path);
+        any = TRUE;
+    }
+
+    g_list_free_full(dirs, g_free);
+
+    if (any) {
+        gtk_widget_show_all(submenu);
+        return;
+    }
+
+empty:
+    {
+        GtkWidget *empty_item = gtk_menu_item_new_with_label("(Empty)");
+        gtk_widget_set_sensitive(empty_item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), empty_item);
+        gtk_widget_show_all(submenu);
+    }
+}
+
+/* Append a single volume entry.  Mounted volumes get a submenu arrow that
+ * drills into the mount root; unmounted volumes are plain clickable items
+ * that open computer:// in the file manager. */
+static void
+append_volume_item(GtkWidget *menu, GVolume *volume)
+{
+    gchar     *name;
+    GIcon     *gicon;
+    gchar     *icon_name = NULL;
+    GMount    *mount;
+    GtkWidget *item;
+
+    name  = g_volume_get_name(volume);
+    gicon = g_volume_get_icon(volume);
+    mount = g_volume_get_mount(volume);
+
+    if (G_IS_THEMED_ICON(gicon)) {
+        const gchar * const *names =
+            g_themed_icon_get_names(G_THEMED_ICON(gicon));
+        if (names != NULL && names[0] != NULL) {
+            icon_name = g_strdup(names[0]);
+        }
+    }
+    if (icon_name == NULL) {
+        icon_name = g_strdup("drive-harddisk");
+    }
+
+    item = create_menu_item_with_icon(name, icon_name);
+
+    if (mount != NULL) {
+        /* Mounted — clicking opens the mount root, hovering drills in */
+        GFile *root      = g_mount_get_root(mount);
+        gchar *uri       = g_file_get_uri(root);
+        gchar *root_path = g_file_get_path(root);
+
+        g_signal_connect_data(
+                G_OBJECT(item), "button-release-event",
+                G_CALLBACK(on_folder_click),
+                g_strdup(uri),
+                (GClosureNotify) g_free,
+                0
+            );
+
+        /* Only attach a drill-down submenu if drill-down is enabled and
+         * the mount has a local path we can scan. */
+        if (current_drilldown_mode != DRILLDOWN_NONE && root_path != NULL) {
+            GDir        *dir        = g_dir_open(root_path, 0, NULL);
+            gboolean     has_subdirs = FALSE;
+            const gchar *child_name;
+
+            if (dir != NULL) {
+                while ((child_name = g_dir_read_name(dir)) != NULL) {
+                    if (child_name[0] == '.') continue;
+                    gchar *child = g_build_filename(root_path, child_name, NULL);
+                    if (g_file_test(child, G_FILE_TEST_IS_DIR)) {
+                        has_subdirs = TRUE;
+                        g_free(child);
+                        break;
+                    }
+                    g_free(child);
+                }
+                g_dir_close(dir);
+            }
+
+            if (has_subdirs) {
+                GtkWidget *submenu = gtk_menu_new();
+                GtkWidget *dummy   = gtk_menu_item_new();
+
+                gtk_menu_set_reserve_toggle_size(GTK_MENU(submenu), FALSE);
+                gtk_menu_shell_append(GTK_MENU_SHELL(submenu), dummy);
+
+                g_signal_connect_data(
+                        G_OBJECT(submenu), "show",
+                        G_CALLBACK(on_mount_submenu_show),
+                        g_strdup(root_path),
+                        (GClosureNotify) g_free,
+                        0
+                    );
+
+                gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
+            }
+
+            g_free(root_path);
+        }
+
+        g_free(uri);
+        g_object_unref(root);
+        g_object_unref(mount);
+    } else {
+        /* Unmounted — clicking opens computer:// so the user can mount it */
+        g_signal_connect_data(
+                G_OBJECT(item), "button-release-event",
+                G_CALLBACK(on_folder_click),
+                g_strdup("computer://"),
+                (GClosureNotify) g_free,
+                0
+            );
+    }
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+
+    g_free(icon_name);
+    g_free(name);
+    g_object_unref(gicon);
+}
+
+/* Mount a volume and open it in the file manager once mounted */
+typedef struct {
+    GVolume *volume;  /* owned */
+} MountData;
+
+static void
+on_mount_ready(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    GVolume *volume = G_VOLUME(source);
+    GError  *error  = NULL;
+
+    if (!g_volume_mount_finish(volume, result, &error)) {
+        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            g_warning("Failed to mount volume: %s",
+                      error ? error->message : "Unknown error");
+        }
+        if (error) g_error_free(error);
+        return;
+    }
+
+    /* Now mounted — open the mount root in the file manager */
+    {
+        GMount *mount   = g_volume_get_mount(volume);
+        GFile  *root    = g_mount_get_root(mount);
+        gchar  *uri     = g_file_get_uri(root);
+        gchar  *command = g_strdup_printf(
+                "exo-open --launch FileManager '%s'", uri
+            );
+        GError *spawn_error = NULL;
+
+        g_spawn_command_line_async(command, &spawn_error);
+        if (spawn_error) g_error_free(spawn_error);
+
+        g_free(command);
+        g_free(uri);
+        g_object_unref(root);
+        g_object_unref(mount);
+    }
+}
+
+static gboolean
+on_unmounted_volume_click(GtkWidget      *item,
+                          GdkEventButton *event,
+                          gpointer        user_data)
+{
+    GVolume              *volume = G_VOLUME(user_data);
+    GMountOperation      *op;
+
+    if (event->button != 1) {
+        return FALSE;
+    }
+
+    gtk_menu_shell_deactivate(
+            GTK_MENU_SHELL(gtk_widget_get_parent(item))
+        );
+
+    op = g_mount_operation_new();
+    g_volume_mount(
+            volume,
+            G_MOUNT_MOUNT_NONE,
+            op,
+            NULL,
+            on_mount_ready,
+            NULL
+        );
+    g_object_unref(op);
+
+    return TRUE;
+}
+
+/* Populate the Computer submenu every time it is shown so that drives
+ * which have been removed or mounted/unmounted since last open are
+ * always reflected accurately. */
+static void
+on_computer_submenu_show(GtkWidget *submenu, gpointer user_data)
+{
+    GVolumeMonitor *monitor;
+    GList          *volumes;
+    GList          *li;
+    GList          *mounted   = NULL;
+    GList          *unmounted = NULL;
+
+    /* Clear whatever was there last time */
+    {
+        GList *children = gtk_container_get_children(GTK_CONTAINER(submenu));
+        g_list_free_full(children, (GDestroyNotify) gtk_widget_destroy);
+    }
+
+    /* ── File System (/) ──────────────────────────────────────────────── */
+    append_folder_item(submenu, "File System", "drive-harddisk", "/");
+
+    monitor = g_volume_monitor_get();
+    volumes = g_volume_monitor_get_volumes(monitor);
+
+    for (li = volumes; li != NULL; li = li->next) {
+        GVolume *volume = G_VOLUME(li->data);
+        GMount  *mount  = g_volume_get_mount(volume);
+
+        if (mount != NULL) {
+            mounted = g_list_append(mounted, g_object_ref(volume));
+            g_object_unref(mount);
+        } else {
+            unmounted = g_list_append(unmounted, g_object_ref(volume));
+        }
+    }
+
+    g_list_free_full(volumes, g_object_unref);
+    g_object_unref(monitor);
+
+    /* ── Mounted volumes ──────────────────────────────────────────────── */
+    if (mounted != NULL) {
+        GtkWidget *sep = gtk_separator_menu_item_new();
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), sep);
+
+        for (li = mounted; li != NULL; li = li->next) {
+            append_volume_item(submenu, G_VOLUME(li->data));
+        }
+        g_list_free_full(mounted, g_object_unref);
+    }
+
+    /* ── Unmounted volumes ────────────────────────────────────────────── */
+    if (unmounted != NULL) {
+        GtkWidget *sep = gtk_separator_menu_item_new();
+        gtk_menu_shell_append(GTK_MENU_SHELL(submenu), sep);
+
+        for (li = unmounted; li != NULL; li = li->next) {
+            GVolume     *volume    = G_VOLUME(li->data);
+            gchar       *name      = g_volume_get_name(volume);
+            GIcon       *gicon     = g_volume_get_icon(volume);
+            gchar       *icon_name = NULL;
+            GtkWidget   *item;
+
+            if (G_IS_THEMED_ICON(gicon)) {
+                const gchar * const *names =
+                    g_themed_icon_get_names(G_THEMED_ICON(gicon));
+                if (names != NULL && names[0] != NULL) {
+                    icon_name = g_strdup(names[0]);
+                }
+            }
+            if (icon_name == NULL) {
+                icon_name = g_strdup("drive-harddisk");
+            }
+
+            item = create_menu_item_with_icon(name, icon_name);
+            g_signal_connect_object(
+                    G_OBJECT(item), "button-release-event",
+                    G_CALLBACK(on_unmounted_volume_click),
+                    volume,
+                    0
+                );
+            gtk_menu_shell_append(GTK_MENU_SHELL(submenu), item);
+
+            g_free(icon_name);
+            g_free(name);
+            g_object_unref(gicon);
+        }
+
+        g_list_free_full(unmounted, g_object_unref);
+    }
+
+    gtk_widget_show_all(submenu);
+}
+
+static void
+append_computer_item(GtkWidget *menu)
+{
+    GtkWidget *item;
+    GtkWidget *submenu;
+    GtkWidget *dummy;
+
+    item = create_menu_item_with_icon("Computer", "computer");
+    g_signal_connect_data(
+            G_OBJECT(item), "button-release-event",
+            G_CALLBACK(on_folder_click),
+            g_strdup("computer://"),
+            (GClosureNotify) g_free,
+            0
+        );
+
+    /* Always attach a submenu — File System alone guarantees it's never
+     * empty, and we repopulate on every show to reflect the current
+     * mount state. */
+    submenu = gtk_menu_new();
+    dummy   = gtk_menu_item_new();
+
+    gtk_menu_set_reserve_toggle_size(GTK_MENU(submenu), FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(submenu), dummy);
+
+    g_signal_connect(
+            G_OBJECT(submenu), "show",
+            G_CALLBACK(on_computer_submenu_show),
+            NULL
+        );
+
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+}
+
+/* Read ~/.config/gtk-3.0/bookmarks (falling back to ~/.gtk-bookmarks) and
+ * append each entry to the menu.  Local file:// entries get full
+ * drill-down navigation; remote URIs get a plain item. */
 static gboolean
 append_gtk_bookmarks(GtkWidget *menu)
 {
-    gchar  *path;
-    gchar  *contents = NULL;
-    gchar **lines;
-    guint   i;
-    gboolean any = FALSE;
+    gchar    *path;
+    gchar    *contents = NULL;
+    gchar   **lines;
+    guint     i;
+    gboolean  any = FALSE;
 
-    /* GTK3 location, fall back to legacy */
     path = g_build_filename(
             g_get_user_config_dir(), "gtk-3.0", "bookmarks", NULL
         );
@@ -109,14 +836,12 @@ append_gtk_bookmarks(GtkWidget *menu)
         gchar       *uri;
         gchar       *space;
         const gchar *label;
-        const gchar *icon_name;
         gchar       *derived_label = NULL;
 
         if (*line == '\0' || *line == '#') {
             continue;
         }
 
-        /* Split on the first space to separate URI from optional label */
         space = strchr(line, ' ');
         if (space != NULL) {
             *space = '\0';
@@ -126,7 +851,6 @@ append_gtk_bookmarks(GtkWidget *menu)
         }
         uri = line;
 
-        /* Fall back to basename of the URI as the label */
         if (label == NULL) {
             GFile *file   = g_file_new_for_uri(uri);
             derived_label = g_file_get_basename(file);
@@ -134,10 +858,18 @@ append_gtk_bookmarks(GtkWidget *menu)
             label = derived_label;
         }
 
-        icon_name = g_str_has_prefix(uri, "file://") ? "folder"
-                                                      : "folder-remote";
+        if (g_str_has_prefix(uri, "file://")) {
+            gchar *local_path = g_filename_from_uri(uri, NULL, NULL);
+            if (local_path != NULL) {
+                append_folder_item(menu, label, "folder", local_path);
+                g_free(local_path);
+            } else {
+                append_uri_item(menu, label, "folder", uri);
+            }
+        } else {
+            append_uri_item(menu, label, "folder-remote", uri);
+        }
 
-        append_uri_item(menu, label, icon_name, uri);
         g_free(derived_label);
         any = TRUE;
     }
@@ -146,68 +878,54 @@ append_gtk_bookmarks(GtkWidget *menu)
     return any;
 }
 
-/* Build the Places menu */
+/* ── Build ──────────────────────────────────────────────────────────────── */
+
 GtkWidget *
-build_places_menu(void)
+build_places_menu(const ClassicMenuConfig *config)
 {
-    GtkWidget   *submenu = gtk_menu_new();
+    GtkWidget   *submenu  = gtk_menu_new();
     GtkWidget   *sep;
     const gchar *home_dir = g_get_home_dir();
-    gchar       *home_uri;
+
+    /* Store the mode in a file-scoped variable so the recursive folder
+     * population callbacks can access it without threading it through
+     * every call. */
+    current_drilldown_mode = config != NULL
+        ? config->drilldown_mode
+        : DRILLDOWN_FOLDERS_ONLY;
 
     gtk_menu_set_reserve_toggle_size(GTK_MENU(submenu), FALSE);
 
     /* ── Home ─────────────────────────────────────────────────────────── */
 
-    home_uri = g_filename_to_uri(home_dir, NULL, NULL);
-    append_uri_item(submenu, "Home Folder", "user-home", home_uri);
-    g_free(home_uri);
+    append_folder_item(submenu, "Home Folder", "user-home", home_dir);
 
-    /* ── GTK bookmarks — mirrors the Thunar sidebar exactly ───────────── */
+    /* ── GTK bookmarks ────────────────────────────────────────────────── */
 
-    /* The bookmarks file contains the XDG folders (Desktop, Documents,
-     * Music, Pictures, Videos, Downloads) as well as any personal
-     * bookmarks the user has added in Thunar, in the order they appear
-     * in the sidebar.  We read it wholesale so the menu stays in sync
-     * with Thunar without any extra configuration. */
     sep = gtk_separator_menu_item_new();
     gtk_menu_shell_append(GTK_MENU_SHELL(submenu), sep);
 
     if (!append_gtk_bookmarks(submenu)) {
-        /* Bookmarks file absent or empty — fall back to the common XDG
-         * dirs so the menu is never completely bare. */
+        /* Fall back to XDG dirs if the bookmarks file is missing */
         gchar *path;
-        gchar *uri;
 
         path = g_build_filename(home_dir, "Desktop",   NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Desktop",   "user-desktop",     uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Desktop",   "user-desktop",    path); g_free(path);
 
         path = g_build_filename(home_dir, "Documents", NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Documents", "folder-documents",  uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Documents", "folder-documents", path); g_free(path);
 
         path = g_build_filename(home_dir, "Music",     NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Music",     "folder-music",      uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Music",     "folder-music",     path); g_free(path);
 
         path = g_build_filename(home_dir, "Pictures",  NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Pictures",  "folder-pictures",   uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Pictures",  "folder-pictures",  path); g_free(path);
 
         path = g_build_filename(home_dir, "Videos",    NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Videos",    "folder-videos",     uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Videos",    "folder-videos",    path); g_free(path);
 
         path = g_build_filename(home_dir, "Downloads", NULL);
-        uri  = g_filename_to_uri(path, NULL, NULL);
-        append_uri_item(submenu, "Downloads", "folder-download",   uri);
-        g_free(uri); g_free(path);
+        append_folder_item(submenu, "Downloads", "folder-download",  path); g_free(path);
 
         sep = gtk_separator_menu_item_new();
         gtk_menu_shell_append(GTK_MENU_SHELL(submenu), sep);
@@ -215,7 +933,7 @@ build_places_menu(void)
 
     /* ── Computer / Network ───────────────────────────────────────────── */
 
-    append_uri_item(submenu, "Computer", "computer",          "computer://");
+    append_computer_item(submenu);
     append_uri_item(submenu, "Network",  "network-workgroup", "network://");
 
     sep = gtk_separator_menu_item_new();
