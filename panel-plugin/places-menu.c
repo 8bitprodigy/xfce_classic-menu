@@ -3,6 +3,8 @@
 #include "classic-menu.h"
 #include "appimage-thumbs.h"
 #include <gio/gio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* The active drill-down mode, set once per build_places_menu() call and
  * read by the recursive folder population functions. */
@@ -67,17 +69,69 @@ on_place_activate(GtkMenuItem *item, gpointer user_data)
     g_free(command);
 }
 
-/* Open a local path on click.  Connected to "button-release-event" so
- * that merely hovering to reveal a submenu does not trigger a launch.
- * Directories open in the file manager; executable files and AppImages
- * are launched directly. */
+/* Launch an AppImage directly, prompting to set the executable bit first
+ * if needed. */
+static void
+launch_appimage(const gchar *path, GtkWidget *parent_item)
+{
+    /* Check executable bit */
+    if (access(path, X_OK) != 0) {
+        GtkWidget *dialog;
+        gint       response;
+        gchar     *basename = g_path_get_basename(path);
+
+        dialog = gtk_message_dialog_new(
+                NULL,
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_QUESTION,
+                GTK_BUTTONS_YES_NO,
+                "\"%s\" is not set as executable.\n\n"
+                "Set it as executable and run it?",
+                basename
+            );
+        g_free(basename);
+
+        response = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+
+        if (response != GTK_RESPONSE_YES) {
+            return;
+        }
+
+        /* Set executable bit for owner */
+        struct stat st;
+        if (g_stat(path, &st) == 0) {
+            g_chmod(path, st.st_mode | S_IXUSR);
+        }
+    }
+
+    /* Launch directly */
+    {
+        GError *error   = NULL;
+        gchar  *argv[2] = { (gchar *)path, NULL };
+
+        if (!g_spawn_async(NULL, argv, NULL,
+                           G_SPAWN_DEFAULT, NULL, NULL, NULL, &error)) {
+            g_warning("Failed to launch AppImage %s: %s", path,
+                      error ? error->message : "Unknown error");
+            if (error) g_error_free(error);
+        }
+    }
+}
+
+/* Open a local path on click.  Connected to "button-release-event" for
+ * plain items and "button-press-event" for items with submenus (since GTK
+ * consumes the release event to open the submenu).
+ *
+ * - Directories open in the file manager.
+ * - AppImages are executed directly, with a prompt to set the executable
+ *   bit if needed.
+ * - All other files open via their default application. */
 static gboolean
 on_folder_click(GtkWidget *item, GdkEventButton *event, gpointer user_data)
 {
-    const gchar *uri = (const gchar *)user_data;
+    const gchar *uri  = (const gchar *)user_data;
     gchar       *path;
-    GError      *error   = NULL;
-    gboolean     handled = FALSE;
 
     if (event->button != 1) {
         return FALSE;
@@ -86,28 +140,31 @@ on_folder_click(GtkWidget *item, GdkEventButton *event, gpointer user_data)
     path = g_filename_from_uri(uri, NULL, NULL);
 
     if (path != NULL && !g_file_test(path, G_FILE_TEST_IS_DIR)) {
-        /* It's a file — open it with its default application, respecting
-         * MIME type associations exactly as Thunar would on double-click. */
-        if (g_app_info_launch_default_for_uri(uri, NULL, &error)) {
-            handled = TRUE;
+        /* It's a file */
+        if (g_str_has_suffix(path, ".AppImage")
+                || g_str_has_suffix(path, ".appimage")) {
+            launch_appimage(path, item);
         } else {
-            g_warning("Failed to open %s: %s", uri,
-                      error ? error->message : "Unknown error");
-            if (error) g_error_free(error);
+            GError *error = NULL;
+            if (!g_app_info_launch_default_for_uri(uri, NULL, &error)) {
+                g_warning("Failed to open %s: %s", uri,
+                          error ? error->message : "Unknown error");
+                if (error) g_error_free(error);
+            }
         }
+        g_free(path);
+        gtk_menu_shell_deactivate(
+                GTK_MENU_SHELL(gtk_widget_get_parent(item))
+            );
+        return TRUE;
     }
 
     g_free(path);
 
-    if (!handled) {
-        on_place_activate(GTK_MENU_ITEM(item), user_data);
-    }
-
-    gtk_menu_shell_deactivate(
-            GTK_MENU_SHELL(gtk_widget_get_parent(item))
-        );
-
-    return TRUE;
+    /* It's a directory — open in file manager and let GTK continue
+     * so the submenu opens on the same click. */
+    on_place_activate(GTK_MENU_ITEM(item), user_data);
+    return FALSE;
 }
 
 /* Append a plain URI item (for non-local or non-directory entries) */
@@ -321,12 +378,60 @@ empty:
     }
 }
 
-/* Append a local folder item.
- *
- * Clicking it opens the folder in the file manager.  If the directory
- * has any child directories a submenu arrow is shown; hovering it lazily
- * populates and displays a submenu listing those children, each with the
- * same behaviour recursively. */
+/* Menu-level button-release handler.  Connected to each GtkMenu that
+ * contains folder items with submenus.  Launches the folder when the
+ * user releases over the same item they pressed on, but not if the
+ * pointer has moved outside the menu window. */
+static gboolean
+on_menu_button_press(GtkWidget *menu, GdkEventButton *event, gpointer user_data)
+{
+    GtkWidget    *item;
+    const gchar  *uri;
+    GdkWindow    *menu_window;
+    gint          win_x, win_y, win_w, win_h;
+    gint          ptr_x, ptr_y;
+
+    if (event->button != 1) {
+        return FALSE;
+    }
+
+    menu_window = gtk_widget_get_window(menu);
+    if (menu_window == NULL) {
+        return FALSE;
+    }
+
+    /* Get the menu window's position and size in screen coordinates */
+    gdk_window_get_origin(menu_window, &win_x, &win_y);
+    win_w = gdk_window_get_width(menu_window);
+    win_h = gdk_window_get_height(menu_window);
+
+    /* Get the true pointer position in screen coordinates at release */
+    gdk_device_get_position(event->device,
+                            NULL, &ptr_x, &ptr_y);
+
+    if (ptr_x < win_x || ptr_y < win_y
+            || ptr_x >= win_x + win_w
+            || ptr_y >= win_y + win_h) {
+        return FALSE;
+    }
+
+    item = GTK_WIDGET(
+            gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menu))
+        );
+
+    if (item == NULL) {
+        return FALSE;
+    }
+
+    uri = (const gchar *)g_object_get_data(G_OBJECT(item), "folder-uri");
+    if (uri == NULL) {
+        return FALSE;
+    }
+
+    on_place_activate(GTK_MENU_ITEM(item), (gpointer)uri);
+
+    return FALSE;
+}
 static void
 append_folder_item(GtkWidget   *menu,
                    const gchar *label,
@@ -340,16 +445,17 @@ append_folder_item(GtkWidget   *menu,
     item = create_menu_item_with_icon(label, icon_name);
 
     uri = g_filename_to_uri(path, NULL, NULL);
-    g_signal_connect_data(
-            G_OBJECT(item), "button-release-event",
-            G_CALLBACK(on_folder_click),
-            uri,
-            (GClosureNotify) g_free,
-            0
-        );
 
-    /* When drill-down is disabled, just append the item with no submenu */
+    /* When drill-down is disabled, just append the item with no submenu.
+     * Use button-release-event since there's no submenu to compete with. */
     if (current_drilldown_mode == DRILLDOWN_NONE) {
+        g_signal_connect_data(
+                G_OBJECT(item), "button-release-event",
+                G_CALLBACK(on_folder_click),
+                uri,
+                (GClosureNotify) g_free,
+                0
+            );
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
         return;
     }
@@ -418,6 +524,29 @@ append_folder_item(GtkWidget   *menu,
             );
 
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
+
+        /* Store the URI on the item so the parent menu's press handler
+         * can retrieve it.  Connect that handler to the parent menu
+         * once only. */
+        g_object_set_data_full(G_OBJECT(item), "folder-uri",
+                               uri, (GDestroyNotify) g_free);
+
+        if (g_object_get_data(G_OBJECT(menu), "folder-press-connected") == NULL) {
+            g_signal_connect(G_OBJECT(menu), "button-release-event",
+                             G_CALLBACK(on_menu_button_press), NULL);
+            g_object_set_data(G_OBJECT(menu), "folder-press-connected",
+                              GINT_TO_POINTER(1));
+        }
+
+    } else {
+        /* No submenu — button-release-event opens in file manager */
+        g_signal_connect_data(
+                G_OBJECT(item), "button-release-event",
+                G_CALLBACK(on_folder_click),
+                uri,
+                (GClosureNotify) g_free,
+                0
+            );
     }
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
