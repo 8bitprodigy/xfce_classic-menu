@@ -167,7 +167,8 @@ on_folder_click(GtkWidget *item, GdkEventButton *event, gpointer user_data)
     return FALSE;
 }
 
-/* Append a plain URI item (for non-local or non-directory entries) */
+
+
 static void
 append_uri_item(GtkWidget   *menu,
                 const gchar *label,
@@ -378,77 +379,8 @@ empty:
     }
 }
 
-/* Menu-level button-release handler.  Connected to each GtkMenu that
- * contains folder items with submenus.  Launches the folder when the
- * user releases over the same item they pressed on, but not if the
- * pointer has moved outside the menu window, and not if the release
- * arrives within 300 ms of the menu becoming visible (which would mean
- * it's the release of the click that opened the menu itself). */
-static gboolean
-on_menu_button_press(GtkWidget *menu, GdkEventButton *event, gpointer user_data)
-{
-    GtkWidget    *item;
-    const gchar  *uri;
-    GdkWindow    *menu_window;
-    gint          win_x, win_y, win_w, win_h;
-    gint          ptr_x, ptr_y;
-    guint32       show_time;
 
-    if (event->button != 1) {
-        return FALSE;
-    }
 
-    /* Ignore releases that belong to the click that opened the menu */
-    show_time = GPOINTER_TO_UINT(
-            g_object_get_data(G_OBJECT(menu), "folder-show-time")
-        );
-    if (show_time > 0 && event->time - show_time < 300) {
-        return FALSE;
-    }
-
-    menu_window = gtk_widget_get_window(menu);
-    if (menu_window == NULL) {
-        return FALSE;
-    }
-
-    gdk_window_get_origin(menu_window, &win_x, &win_y);
-    win_w = gdk_window_get_width(menu_window);
-    win_h = gdk_window_get_height(menu_window);
-
-    gdk_device_get_position(event->device, NULL, &ptr_x, &ptr_y);
-
-    if (ptr_x < win_x || ptr_y < win_y
-            || ptr_x >= win_x + win_w
-            || ptr_y >= win_y + win_h) {
-        return FALSE;
-    }
-
-    item = GTK_WIDGET(
-            gtk_menu_shell_get_selected_item(GTK_MENU_SHELL(menu))
-        );
-
-    if (item == NULL) {
-        return FALSE;
-    }
-
-    uri = (const gchar *)g_object_get_data(G_OBJECT(item), "folder-uri");
-    if (uri == NULL) {
-        return FALSE;
-    }
-
-    on_place_activate(GTK_MENU_ITEM(item), (gpointer)uri);
-
-    return FALSE;
-}
-
-/* Record the time the menu became visible so on_menu_button_press can
- * ignore releases that are part of the click that opened it. */
-static void
-on_folder_menu_show(GtkWidget *menu, gpointer user_data)
-{
-    g_object_set_data(G_OBJECT(menu), "folder-show-time",
-                      GUINT_TO_POINTER(gtk_get_current_event_time()));
-}
 static void
 append_folder_item(GtkWidget   *menu,
                    const gchar *label,
@@ -542,20 +474,16 @@ append_folder_item(GtkWidget   *menu,
 
         gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
 
-        /* Store the URI on the item so the parent menu's press handler
-         * can retrieve it.  Connect that handler to the parent menu
-         * once only. */
         g_object_set_data_full(G_OBJECT(item), "folder-uri",
-                               uri, (GDestroyNotify) g_free);
+                               g_strdup(uri), (GDestroyNotify) g_free);
 
-        if (g_object_get_data(G_OBJECT(menu), "folder-press-connected") == NULL) {
-            g_signal_connect(G_OBJECT(menu), "button-release-event",
-                             G_CALLBACK(on_menu_button_press), NULL);
-            g_signal_connect(G_OBJECT(menu), "show",
-                             G_CALLBACK(on_folder_menu_show), NULL);
-            g_object_set_data(G_OBJECT(menu), "folder-press-connected",
-                              GINT_TO_POINTER(1));
-        }
+        /* GTK consumes button-release-event on items with submenus, but
+         * button-press-event fires before GTK grabs it. */
+        g_signal_connect_data(G_OBJECT(item), "button-press-event",
+                              G_CALLBACK(on_folder_click),
+                              uri,
+                              (GClosureNotify) g_free,
+                              0);
 
     } else {
         /* No submenu — button-release-event opens in file manager */
